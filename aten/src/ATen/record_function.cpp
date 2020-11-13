@@ -120,14 +120,13 @@ class CallbackManager {
   // init is called by RecordFunction in constructor to
   // determine which thread local and global callbacks are going
   // to be executed and whether any of them need inputs
-  inline void init(RecordFunction& rec_fn) {
-    auto scope = rec_fn.scope();
+  inline void init(RecordFunction& rec_fn, RecordScope scope) {
     bool found_active_cb = false;
     bool found_needs_inputs = false;
     bool found_needs_ids = false;
     auto init_handles = [
         scope, &found_active_cb, &found_needs_inputs, &found_needs_ids](
-          CallbackHandles& handles, RecordFunctionCallbacks& cbs, ObserverContextList& ctx_list) {
+          CallbackHandles& handles, RecordFunctionCallbacks& cbs) {
       handles.clear();
 
       size_t num_callbacks = 0;
@@ -144,14 +143,35 @@ class CallbackManager {
           }
         }
       }
-      // Pre-allocate observer context list with nullptr.
-      ctx_list.resize(num_callbacks);
+      return num_callbacks;
     };
 
-    init_handles(rec_fn.sorted_active_tls_handles_, rf_tls_.sorted_tls_callbacks_, rec_fn.tls_ctx_);
-    init_handles(rec_fn.sorted_active_global_handles_, sorted_global_callbacks_, rec_fn.global_ctx_);
-    rec_fn.active_ = found_active_cb;
-    rec_fn.needs_inputs = found_needs_inputs;
+    // Don't bother constructing temporary vectors if we know we won't do anything.
+    if (rf_tls_.sorted_tls_callbacks_.empty() && sorted_global_callbacks_.empty()) {
+      return;
+    }
+
+    // Keep temporary state on the stack in case we don't find an
+    // active callback so that we can avoid allocating state in that
+    // case.
+    CallbackHandles sorted_active_tls_handles;
+    CallbackHandles sorted_active_global_handles;
+    ObserverContextList tls_ctx;
+    ObserverContextList global_ctx;
+    size_t num_tls_callbacks = init_handles(sorted_active_tls_handles, rf_tls_.sorted_tls_callbacks_);
+    size_t num_global_callbacks = init_handles(sorted_active_global_handles, sorted_global_callbacks_);
+    if (!found_active_cb) {
+      return;
+    }
+
+    rec_fn.state_ = std::make_unique<RecordFunction::State>(scope);
+    // Pre-allocate observer context list with nullptr.
+    rec_fn.state_->tls_ctx_.resize(num_tls_callbacks);
+    rec_fn.state_->global_ctx_.resize(num_global_callbacks);
+
+    rec_fn.state_->sorted_active_tls_handles_ = std::move(sorted_active_tls_handles);
+    rec_fn.state_->sorted_active_global_handles_ = std::move(sorted_active_global_handles);
+    rec_fn.state_->needs_inputs = found_needs_inputs;
     if (found_needs_ids && found_active_cb) {
       rec_fn.setHandle(next_unique_record_function_handle());
     }
@@ -160,30 +180,30 @@ class CallbackManager {
   void runStartCallbacks(RecordFunction& rf) {
     mergeRunCallbacks(
         sorted_global_callbacks_,
-        rf.sorted_active_global_handles_,
-        rf.global_ctx_,
+        rf.state_->sorted_active_global_handles_,
+        rf.state_->global_ctx_,
         /* is_start */ true,
         rf);
     mergeRunCallbacks(
         rf_tls_.sorted_tls_callbacks_,
-        rf.sorted_active_tls_handles_,
-        rf.tls_ctx_,
+        rf.state_->sorted_active_tls_handles_,
+        rf.state_->tls_ctx_,
         /* is_start */ true,
         rf);
-    rf.called_start_callbacks_ = true;
+    rf.state_->called_start_callbacks_ = true;
   }
 
   void runEndCallbacks(RecordFunction& rf) {
     mergeRunCallbacks(
         sorted_global_callbacks_,
-        rf.sorted_active_global_handles_,
-        rf.global_ctx_,
+        rf.state_->sorted_active_global_handles_,
+        rf.state_->global_ctx_,
         /* is_start */ false,
         rf);
     mergeRunCallbacks(
         rf_tls_.sorted_tls_callbacks_,
-        rf.sorted_active_tls_handles_,
-        rf.tls_ctx_,
+        rf.state_->sorted_active_tls_handles_,
+        rf.state_->tls_ctx_,
         /* is_start */ false,
         rf);
   }
@@ -352,12 +372,12 @@ void enableRecordFunction(bool enable) {
   rf_tls_.tls_record_function_enabled_ = enable;
 }
 
-RecordFunction::RecordFunction(RecordScope scope) : scope_(scope) {
+RecordFunction::RecordFunction(RecordScope scope) {
   auto* rf_tls_ptr = &rf_tls_;
   auto& m = manager();
   if (rf_tls_ptr->tls_record_function_enabled_ &&
       (!m.sorted_global_callbacks_.empty() || !rf_tls_ptr->sorted_tls_callbacks_.empty())) {
-    m.init(*this);
+    m.init(*this, scope);
   }
 }
 
@@ -374,10 +394,10 @@ void RecordFunction::before(const char* name, int64_t sequence_nr) {
   if (!isActive()) {
     return;
   }
-  name_ = StringView(name);
-  sequence_nr_ = sequence_nr;
-  thread_id_ = currentThreadId();
-  operator_name_.reset();
+  state_->name_ = StringView(name);
+  state_->sequence_nr_ = sequence_nr;
+  state_->thread_id_ = currentThreadId();
+  state_->operator_name_.reset();
 
   manager().runStartCallbacks(*this);
 }
@@ -386,10 +406,10 @@ void RecordFunction::before(std::string name, int64_t sequence_nr) {
   if (!isActive()) {
     return;
   }
-  name_ = StringView(std::move(name));
-  sequence_nr_ = sequence_nr;
-  thread_id_ = currentThreadId();
-  operator_name_.reset();
+  state_->name_ = StringView(std::move(name));
+  state_->sequence_nr_ = sequence_nr;
+  state_->thread_id_ = currentThreadId();
+  state_->operator_name_.reset();
 
   manager().runStartCallbacks(*this);
 }
@@ -400,10 +420,10 @@ void RecordFunction::before(
   if (!isActive()) {
     return;
   }
-  sequence_nr_ = sequence_nr;
-  thread_id_ = currentThreadId();
-  operator_name_ = op.operator_name();
-  name_ = StringView(op.schema().name());
+  state_->sequence_nr_ = sequence_nr;
+  state_->thread_id_ = currentThreadId();
+  state_->operator_name_ = op.operator_name();
+  state_->name_ = StringView(op.schema().name());
 
   manager().runStartCallbacks(*this);
 }
@@ -422,10 +442,10 @@ RecordFunction::~RecordFunction() {
 }
 
 void RecordFunction::end() {
-  if (isActive() && called_start_callbacks_) {
+  if (isActive() && state_->called_start_callbacks_) {
     manager().runEndCallbacks(*this);
+    state_.reset();
   }
-  active_ = false;
 }
 
 } // namespace at
