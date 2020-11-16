@@ -28,6 +28,24 @@ VkDeviceSize bytes(
   return size;
 }
 
+VkFormat convert(const caffe2::TypeMeta dtype) {
+  switch (c10::typeMetaToScalarType(dtype)) {
+    case kFloat:
+    #ifdef USE_VULKAN_FP16_INFERENCE
+      return VK_FORMAT_R16G16B16A16_SFLOAT;
+    #else
+      return VK_FORMAT_R32G32B32A32_SFLOAT;
+    #endif /* USE_VULKAN_FP16_INFERENCE */
+
+    default:
+      TORCH_CHECK(
+        false,
+        "Vulkan tensor format not supported!");
+  }
+
+  return VK_FORMAT_UNDEFINED;
+}
+
 vTensor::Access::Flags convert(const VkAccessFlags vk_access) {
   vTensor::Access::Flags access = 0u;
 
@@ -74,30 +92,24 @@ vTensor::Buffer allocate_buffer(
   // Forward declaration
   bool requires_staging(const api::Adapter*);
 
-  const VkFlags usage = [adapter]() {
-    VkFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-
-    if (requires_staging(adapter)) {
-      usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    }
-
-    return usage;
-  }();
+  const VkFlags usage =
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+      VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
   const auto memory = [adapter]() -> api::Resource::Memory::Descriptor {
     if (requires_staging(adapter)) {
       return {
         VMA_MEMORY_USAGE_GPU_ONLY,
         0u,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        0u,
       };
     }
 
     return {
-      VMA_MEMORY_USAGE_UNKNOWN,
-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      VMA_MEMORY_USAGE_GPU_TO_CPU,
+      0u,
+      0u,
     };
   }();
 
@@ -167,7 +179,7 @@ vTensor::Image allocate_image(
 
   return pool->image({
       VK_IMAGE_TYPE_3D,
-      api::utils::convert(options.dtype()),
+      convert(options.dtype()),
       extents,
       // Usage
       {
@@ -176,13 +188,20 @@ vTensor::Image allocate_image(
         {
           VMA_MEMORY_USAGE_GPU_ONLY,
           0u,
-          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+          0u,
         },
       },
       // View
       {
         VK_IMAGE_VIEW_TYPE_3D,
-        api::utils::convert(options.dtype()),
+        convert(options.dtype()),
+      },
+      // Sampler
+      {
+        VK_FILTER_NEAREST,
+        VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
       },
     });
 }
@@ -250,8 +269,8 @@ Barrier categorize(
   const vTensor::Access::Flags src_access = convert(vk_src_access);
   const vTensor::Access::Flags dst_access = convert(vk_dst_access);
 
-  if (vTensor::Access::Read == (src_access & vTensor::Access::Read)) {
-    if (vTensor::Access::Read == (dst_access & vTensor::Access::Read)) {
+  if ((src_access & vTensor::Access::Read) == src_access) {
+    if ((dst_access & vTensor::Access::Read) == dst_access) {
       // RAR (Read after Read)
       return Barrier::None;
     }
@@ -399,7 +418,7 @@ vTensor::View::View(
 
 class vTensor::View::CMD final {
  public:
-  CMD(const View&);
+  explicit CMD(const View&);
   CMD(const View&, api::Command::Buffer&);
   CMD(const CMD&) = delete;
   CMD& operator=(const CMD&) = delete;
@@ -901,7 +920,7 @@ vTensor::Image& vTensor::View::image(
               return vk_access;
             }(),
             [access]() {
-              if (Access::Read == (access & Access::Read)) {
+              if ((access & Access::Read) == access) {
                 return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
               }
 
